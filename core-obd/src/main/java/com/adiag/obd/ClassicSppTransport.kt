@@ -1,6 +1,7 @@
 package com.adiag.obd
 
 import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothSocket
 import kotlinx.coroutines.Dispatchers
@@ -10,6 +11,21 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.util.UUID
 
+/**
+ * Transporte Bluetooth Classic (SPP) hacia el adaptador.
+ *
+ * Estrategia de conexion, en orden:
+ *   1. RFCOMM inseguro con el UUID estandar de SPP. Es el que funciona con la
+ *      mayoria de clones ELM327 y **no exige emparejamiento previo**, asi que
+ *      evita por completo el problema del PIN.
+ *   2. RFCOMM seguro con el mismo UUID, para adaptadores que si exigen enlace.
+ *   3. createRfcommSocket(1) por reflexion, para clones que no publican el
+ *      registro SDP de SPP.
+ *
+ * Antes de cualquier intento se cancela el discovery: un escaneo activo hace
+ * fallar la conexion RFCOMM, y como el picker de la app escanea para encontrar
+ * el adaptador, es muy probable que siga corriendo al llegar aqui.
+ */
 @SuppressLint("MissingPermission")
 class ClassicSppTransport(private val device: BluetoothDevice) : ObdTransport {
 
@@ -20,22 +36,38 @@ class ClassicSppTransport(private val device: BluetoothDevice) : ObdTransport {
     private var output: OutputStream? = null
 
     override suspend fun connect(): Result<Unit> = withContext(Dispatchers.IO) {
-        runCatching {
-            val s = device.createRfcommSocketToServiceRecord(SPP_UUID)
-            s.connect()
-            socket = s
-            input = s.inputStream
-            output = s.outputStream
-        }.recoverCatching {
-            // Fallback conocido para clones ELM327 que no publican el record SPP.
-            val fallback = device.javaClass
-                .getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
-                .invoke(device, 1) as BluetoothSocket
-            fallback.connect()
-            socket = fallback
-            input = fallback.inputStream
-            output = fallback.outputStream
+        // Un discovery en curso rompe RFCOMM. Siempre cancelarlo primero.
+        runCatching { BluetoothAdapter.getDefaultAdapter()?.cancelDiscovery() }
+
+        val attempts: List<Pair<String, () -> BluetoothSocket>> = listOf(
+            "SPP inseguro" to {
+                device.createInsecureRfcommSocketToServiceRecord(SPP_UUID)
+            },
+            "SPP seguro" to {
+                device.createRfcommSocketToServiceRecord(SPP_UUID)
+            },
+            "canal 1 directo" to {
+                device.javaClass
+                    .getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    .invoke(device, 1) as BluetoothSocket
+            },
+        )
+
+        val errors = mutableListOf<String>()
+        for ((label, factory) in attempts) {
+            val result = runCatching {
+                val s = factory()
+                s.connect()
+                socket = s
+                input = s.inputStream
+                output = s.outputStream
+            }
+            if (result.isSuccess) return@withContext Result.success(Unit)
+            runCatching { socket?.close() }
+            socket = null
+            errors += "$label: ${result.exceptionOrNull()?.message ?: "fallo"}"
         }
+        Result.failure(ObdException(errors.joinToString(" | ")))
     }
 
     override suspend fun send(command: String, timeoutMs: Long): Result<String> =

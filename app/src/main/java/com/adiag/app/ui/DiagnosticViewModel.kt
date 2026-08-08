@@ -66,24 +66,40 @@ class DiagnosticViewModel @Inject constructor(
     }
 
     /**
-     * Fuerza el emparejamiento con PIN inyectado (ver BondManager) antes de
-     * abrir el socket. El NexLink no siempre completa el bonding iniciado
-     * desde Ajustes del sistema, asi que este paso es obligatorio incluso si
-     * el dispositivo ya aparece como "conocido" en Android.
+     * Conecta al adaptador.
+     *
+     * El orden importa: se intenta abrir el socket **antes** de emparejar,
+     * porque la mayoria de clones ELM327 aceptan RFCOMM inseguro sin bonding
+     * previo. Solo si eso falla se fuerza el emparejamiento y se reintenta.
+     * Al reves (como estaba antes) se quedaba trabado pidiendo un PIN que el
+     * adaptador ni siquiera necesitaba.
      */
     fun connect(device: BluetoothDevice) = viewModelScope.launch {
-        _state.value = _state.value.copy(connection = ConnectionState.Connecting("Emparejando"))
-        val bond = BondManager.ensureBonded(context, device)
-        if (bond.isFailure) {
-            _state.value = _state.value.copy(
-                connection = ConnectionState.Failed(
-                    bond.exceptionOrNull()?.message ?: "No se pudo emparejar"
-                )
-            )
-            return@launch
-        }
+        // Un discovery activo hace fallar RFCOMM. Cortarlo ya, sin esperar a
+        // que se agote la ventana de busqueda.
+        scanner.stop()
+        _state.value = _state.value.copy(searchingAdapters = false)
 
         _state.value = _state.value.copy(connection = ConnectionState.Connecting("Enlazando"))
+        var result = openSession(device)
+
+        if (result is ConnectionState.Failed && device.bondState != BluetoothDevice.BOND_BONDED) {
+            _state.value = _state.value.copy(connection = ConnectionState.Connecting("Emparejando"))
+            val bond = BondManager.ensureBonded(context, device)
+            if (bond.isSuccess) {
+                _state.value = _state.value.copy(connection = ConnectionState.Connecting("Reintentando"))
+                result = openSession(device)
+            } else {
+                val why = bond.exceptionOrNull()?.message ?: "no se pudo emparejar"
+                result = ConnectionState.Failed("${(result as ConnectionState.Failed).reason} | $why")
+            }
+        }
+
+        _state.value = _state.value.copy(connection = result)
+    }
+
+    /** Prueba SPP y, si no responde, BLE. Devuelve el estado resultante. */
+    private suspend fun openSession(device: BluetoothDevice): ConnectionState {
         var s = ElmSession(ClassicSppTransport(device))
         var result = s.open()
         if (result is ConnectionState.Failed) {
@@ -91,9 +107,10 @@ class DiagnosticViewModel @Inject constructor(
             _state.value = _state.value.copy(connection = ConnectionState.Connecting("Probando BLE"))
             s = ElmSession(BleGattTransport(context, device))
             result = s.open()
+            if (result is ConnectionState.Failed) s.close()
         }
         session = s.takeIf { result is ConnectionState.Connected }
-        _state.value = _state.value.copy(connection = result)
+        return result
     }
 
     fun scan() = viewModelScope.launch {
