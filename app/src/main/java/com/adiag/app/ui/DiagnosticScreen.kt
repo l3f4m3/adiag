@@ -18,7 +18,6 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -32,7 +31,6 @@ import com.adiag.model.Severity
 @Composable
 fun DiagnosticScreen(vm: DiagnosticViewModel = hiltViewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
-    val devices = remember { vm.pairedAdapters() }
 
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
 
@@ -43,7 +41,12 @@ fun DiagnosticScreen(vm: DiagnosticViewModel = hiltViewModel()) {
         )
 
         when (val c = state.connection) {
-            is ConnectionState.Disconnected -> AdapterPicker(devices, vm::connect)
+            is ConnectionState.Disconnected -> AdapterPicker(
+                devices = state.nearbyAdapters,
+                searching = state.searchingAdapters,
+                onSearch = vm::findAdapters,
+                onPick = vm::connect,
+            )
             is ConnectionState.Connecting -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(Modifier.padding(end = 12.dp))
                 Text(c.stage)
@@ -57,7 +60,12 @@ fun DiagnosticScreen(vm: DiagnosticViewModel = hiltViewModel()) {
             }
             is ConnectionState.Failed -> {
                 Text("No se pudo conectar: ${c.reason}", color = MaterialTheme.colorScheme.error)
-                AdapterPicker(devices, vm::connect)
+                AdapterPicker(
+                    devices = state.nearbyAdapters,
+                    searching = state.searchingAdapters,
+                    onSearch = vm::findAdapters,
+                    onPick = vm::connect,
+                )
             }
         }
 
@@ -71,12 +79,25 @@ fun DiagnosticScreen(vm: DiagnosticViewModel = hiltViewModel()) {
 }
 
 @Composable
-private fun AdapterPicker(devices: List<BluetoothDevice>, onPick: (BluetoothDevice) -> Unit) {
-    if (devices.isEmpty()) {
-        Text("Empareja el NEXAS NX230731 en los ajustes de Bluetooth (PIN 1234) y vuelve.")
-        return
-    }
+private fun AdapterPicker(
+    devices: List<BluetoothDevice>,
+    searching: Boolean,
+    onSearch: () -> Unit,
+    onPick: (BluetoothDevice) -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            "Enciende el contacto del auto (switch en posicion II) antes de buscar: " +
+                "el NexLink solo transmite con corriente en el puerto OBD2.",
+            style = MaterialTheme.typography.bodySmall
+        )
+        Button(onClick = onSearch, enabled = !searching, modifier = Modifier.fillMaxWidth()) {
+            Text(if (searching) "Buscando..." else "Buscar adaptador")
+        }
+        if (searching) CircularProgressIndicator(Modifier.padding(top = 4.dp))
+        if (devices.isEmpty() && !searching) {
+            Text("Ningun adaptador encontrado todavia.", style = MaterialTheme.typography.bodySmall)
+        }
         devices.forEach { d ->
             OutlinedButton(onClick = { onPick(d) }, modifier = Modifier.fillMaxWidth()) {
                 Text(d.name ?: d.address)

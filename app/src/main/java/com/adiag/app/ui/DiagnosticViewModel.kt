@@ -1,7 +1,6 @@
 package com.adiag.app.ui
 
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.content.Context
 import androidx.lifecycle.ViewModel
@@ -11,7 +10,9 @@ import com.adiag.model.ConnectionState
 import com.adiag.model.Dtc
 import com.adiag.model.Vehicle
 import com.adiag.obd.BleGattTransport
+import com.adiag.obd.BondManager
 import com.adiag.obd.ClassicSppTransport
+import com.adiag.obd.DeviceScanner
 import com.adiag.obd.ElmSession
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -19,6 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import javax.inject.Inject
 
 data class UiState(
@@ -26,6 +28,8 @@ data class UiState(
     val vehicle: Vehicle = Vehicle.DEFAULT,
     val dtcs: List<Dtc> = emptyList(),
     val scanning: Boolean = false,
+    val searchingAdapters: Boolean = false,
+    val nearbyAdapters: List<BluetoothDevice> = emptyList(),
     val message: String? = null,
 )
 
@@ -40,19 +44,45 @@ class DiagnosticViewModel @Inject constructor(
     val state: StateFlow<UiState> = _state.asStateFlow()
 
     private var session: ElmSession? = null
+    private val scanner = DeviceScanner(context)
 
-    fun pairedAdapters(): List<BluetoothDevice> {
-        val adapter = BluetoothAdapter.getDefaultAdapter() ?: return emptyList()
-        return runCatching {
-            adapter.bondedDevices.filter { dev ->
+    /**
+     * Busca adaptadores cercanos (emparejados o no). 12s de ventana: es lo
+     * que tarda Android en completar un ciclo de discovery clasico.
+     */
+    fun findAdapters() = viewModelScope.launch {
+        _state.value = _state.value.copy(searchingAdapters = true, nearbyAdapters = emptyList())
+        val found = linkedMapOf<String, BluetoothDevice>()
+        withTimeoutOrNull(12_000) {
+            scanner.discover().collect { dev ->
                 val n = dev.name?.uppercase().orEmpty()
-                ADAPTER_HINTS.any { n.contains(it) }
+                if (ADAPTER_HINTS.any { n.contains(it) }) {
+                    found[dev.address] = dev
+                    _state.value = _state.value.copy(nearbyAdapters = found.values.toList())
+                }
             }
-        }.getOrDefault(emptyList())
+        }
+        _state.value = _state.value.copy(searchingAdapters = false)
     }
 
-    /** Intenta SPP primero (mas estable en Android) y cae a BLE. */
+    /**
+     * Fuerza el emparejamiento con PIN inyectado (ver BondManager) antes de
+     * abrir el socket. El NexLink no siempre completa el bonding iniciado
+     * desde Ajustes del sistema, asi que este paso es obligatorio incluso si
+     * el dispositivo ya aparece como "conocido" en Android.
+     */
     fun connect(device: BluetoothDevice) = viewModelScope.launch {
+        _state.value = _state.value.copy(connection = ConnectionState.Connecting("Emparejando"))
+        val bond = BondManager.ensureBonded(context, device)
+        if (bond.isFailure) {
+            _state.value = _state.value.copy(
+                connection = ConnectionState.Failed(
+                    bond.exceptionOrNull()?.message ?: "No se pudo emparejar"
+                )
+            )
+            return@launch
+        }
+
         _state.value = _state.value.copy(connection = ConnectionState.Connecting("Enlazando"))
         var s = ElmSession(ClassicSppTransport(device))
         var result = s.open()
